@@ -19,7 +19,7 @@ from mpc import Action_Optimizer
 
 # Hyperparameters
 parser = argparse.ArgumentParser(description='PlaNet or Dreamer')
-parser.add_argument('--algo', type=str, default='planet', help='planet or dreamer')
+parser.add_argument('--algo', type=str, default='dreamer', help='planet or dreamer')
 parser.add_argument('--id', type=str, default='default', help='Experiment ID')
 parser.add_argument('--seed', type=int, default=1, metavar='S', help='Random seed')
 parser.add_argument('--disable-cuda', action='store_true', help='Disable CUDA')
@@ -62,20 +62,24 @@ parser.add_argument('--optimisation-iters', type=int, default=10, metavar='I', h
 parser.add_argument('--candidates', type=int, default=1000, metavar='J', help='Candidate samples per iteration')
 parser.add_argument('--top-candidates', type=int, default=100, metavar='K', help='Number of top candidates to fit')
 parser.add_argument('--test', action='store_true',default=True, help='Test only')
-parser.add_argument('--test-interval', type=int, default=25, metavar='I', help='Test interval (episodes)')
+parser.add_argument('--test-interval', type=int, default=50, metavar='I', help='Test interval (episodes)')
 parser.add_argument('--test-episodes', type=int, default=10, metavar='E', help='Number of test episodes')
 parser.add_argument('--checkpoint-interval', type=int, default=50, metavar='I', help='Checkpoint interval (episodes)')
 parser.add_argument('--checkpoint-experience', action='store_true', help='Checkpoint experience replay')
 parser.add_argument('--models', type=str, default='pretrained/cheetah-run_models_500.pth', metavar='M', help='Load model checkpoint')
 parser.add_argument('--experience-replay', type=str, default='', metavar='ER', help='Load experience replay')
 parser.add_argument('--render', action='store_true', help='Render environment')
+parser.add_argument('--action-iters',type=int, default = 20, metavar='AI')
+parser.add_argument('--random-actions',action='store_true',help='Random Actions')
 args = parser.parse_args()
 args.overshooting_distance = min(args.chunk_size, args.overshooting_distance)  # Overshooting distance cannot be greater than chunk size
+if args.random_actions:
+  print('Random Actions')
 print(' ' * 26 + 'Options')
 for k, v in vars(args).items():
   print(' ' * 26 + k + ': ' + str(v))
 
-
+print("Reward Model")
 # Setup
 results_dir = os.path.join('results', '{}_{}'.format(args.env, args.id))
 os.makedirs(results_dir, exist_ok=True)
@@ -147,7 +151,7 @@ if args.algo=="dreamer":
   planner = actor_model
 else:
   planner = MPCPlanner(env.action_size, args.planning_horizon, args.optimisation_iters, args.candidates, args.top_candidates, transition_model, reward_model)
-action_optimizer = Action_Optimizer(env.action_size, args.planning_horizon, args.optimisation_iters, args.candidates, args.top_candidates, transition_model, value_model)
+action_optimizer = Action_Optimizer(env.action_size, args.planning_horizon, args.optimisation_iters, args.candidates, args.top_candidates, transition_model, reward_model)
 global_prior = Normal(torch.zeros(args.batch_size, args.state_size, device=args.device), torch.ones(args.batch_size, args.state_size, device=args.device))  # Global prior N(0, I)
 free_nats = torch.full((1, ), args.free_nats, device=args.device)  # Allowed deviation in KL divergence
 
@@ -162,26 +166,30 @@ def update_belief_and_act(args, env, planner, transition_model, encoder, belief,
   else:
     action = planner(belief, posterior_state)  # Get action from planner(q(s_t|o≤t,a<t), p)
   if args.action_optimizer:
-    actions = action.detach()
+    actions = action.repeat(1,args.candidates,1) # hard code
+    if args.random_actions:
+      actions = torch.randn(actions.size()).cuda()
+    actions = actions.detach()
     actions.requires_grad = True
-    num_iters = 30
+    num_iters = args.action_iters
     # iters were 25, 2, 15
     opti = optim.Adam((actions,), lr=0.01)
     t_belief = belief.clone();t_posterior_state =  posterior_state.clone()
     for _ in range(num_iters):
         if _ > 10:
-          opti = optim.Adam((actions,), lr=0.003)
+          opti = optim.Adam((actions,), lr=0.001)
+        elif _ > 20:
+          opti = optim.Adam((actions,), lr=0.0005)
         opti.zero_grad()
         pred_rewards = action_optimizer(t_belief.detach(), t_posterior_state.detach(), actions)
         loss = pred_rewards
-        # print(loss)
         loss.sum(dim=0).backward()
         opti.step()
-        # print("a",actions,pred_rewards)
-    # _, indices = torch.sort(pred_rewards.squeeze(1))
+    _, indices = torch.sort(pred_rewards)
     # action = actions[0][indices[:50]].mean(0).unsqueeze(0)#todo # top 50
-    # print(action.shape)
-    action = actions[0].unsqueeze(0)
+    # print(actions.shape,'pr',pred_rewards.shape,indices[-1])
+    actions = actions.squeeze(0)
+    action = actions[indices[0]].unsqueeze(0)
 
   if explore:
     action = torch.clamp(Normal(action, args.action_noise).rsample(), -1, 1) # Add gaussian exploration noise on top of the sampled action
@@ -198,18 +206,18 @@ if args.test:
   # encoder.eval()
   total_reward = 0
   for _ in tqdm(range(args.test_episodes)):
-    observation = env.reset()
+    observation = env.reset();ep_reward = 0
     belief, posterior_state, action = torch.zeros(1, args.belief_size, device=args.device), torch.zeros(1, args.state_size, device=args.device), torch.zeros(1, env.action_size, device=args.device)
     pbar = tqdm(range(args.max_episode_length // args.action_repeat))
     for t in pbar:
       belief, posterior_state, action, observation, reward, done = update_belief_and_act(args, env, planner, transition_model, encoder, belief, posterior_state, action, observation.to(device=args.device))
-      total_reward += reward
+      total_reward += reward; ep_reward += reward
       if args.render:
         env.render()
       if done:
         pbar.close()
         break
-      
+    print("Reward of episode",_,":",ep_reward)
   print('Average Reward:', total_reward / args.test_episodes)
   env.close()
   quit()

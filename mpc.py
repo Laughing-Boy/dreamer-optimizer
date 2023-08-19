@@ -19,12 +19,13 @@ class Action_Optimizer(nn.Module):
     def forward(self, belief, state,actions):
         B, H, Z = belief.size(0), belief.size(1), state.size(1)
         # Sample next states
-        belief, state = belief.view(-1, H), state.view(-1, Z)
+        belief, state = belief.unsqueeze(dim=1).expand(B, self.candidates, H).reshape(-1, H    ), state.unsqueeze(dim=1).expand(B, self.candidates, Z).reshape(-1, Z)
+        belief, state = belief.view(-1, H), state.view(-1, Z);
         beliefs, states, _, _ = self.transition_model(
-              state, actions.unsqueeze(0), belief)
+              state, actions, belief)
         returns = self.reward_model(
             beliefs.view(-1, H), states.view(-1, Z))
-        retur = returns.view(actions.size(0), -1)
+        retur = returns.view(-1,self.candidates)
         # retur.retain_grad()
         ret = -1*retur.sum(dim=0)
 
